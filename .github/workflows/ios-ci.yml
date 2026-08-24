@@ -1,0 +1,107 @@
+name: iOS CI (reusable)
+
+# The one-true CI workflow for Jon's iOS apps. Each app repo's ci.yml is a thin caller
+# that `uses:` this file and passes `package-path`. Edit the pipeline HERE and every app
+# inherits it. This repo is PUBLIC on purpose: the apps (galavant, yes-chef) are public,
+# and GitHub does not let a public repo call a reusable workflow in a private repo — so
+# the shared workflow can't live in the private jon-platform repo. Nothing secret lives
+# here; the private jon-platform clone below uses each caller's JON_PLATFORM_PAT secret,
+# passed in at runtime via `secrets: inherit` and never exposed by this file.
+#
+# One-time setup per consuming app:
+#   The app repo needs a `JON_PLATFORM_PAT` secret (fine-grained, Contents: read on
+#   jonphillips/jon-platform) so the test job can clone jon-platform for the local-path
+#   SPM deps. (No cross-repo Actions access setting is needed for a public callee.)
+
+on:
+  workflow_call:
+    inputs:
+      package-path:
+        description: "Path (repo-relative) to the SPM package holding the tests, e.g. GalavantLibrary or YesChefPackage."
+        required: true
+        type: string
+      test-runner:
+        description: >-
+          Runner image for the test job. Apps whose manifest the hosted image can
+          already build use a pinned image (e.g. macos-26); apps on a not-yet-shipped
+          toolchain leave the default and the capability gate skips them cleanly until
+          the image catches up.
+        required: false
+        type: string
+        default: macos-latest
+      swiftlint-version:
+        description: "Pinned SwiftLint container tag for the lint job (reproducible drift gate)."
+        required: false
+        type: string
+        default: "0.63.3"
+    secrets:
+      JON_PLATFORM_PAT:
+        description: "Read-only PAT (Contents: read on jonphillips/jon-platform) to clone the private repo for local-path SPM deps."
+        required: true
+
+jobs:
+  # Zero-Xcode drift gate: size thresholds + the view_persistence rule + the test
+  # suite. Pinned SwiftLint for reproducibility; discovers each repo's .swiftlint.yml.
+  lint:
+    runs-on: ubuntu-latest
+    container: ghcr.io/realm/swiftlint:${{ inputs.swiftlint-version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: swiftlint lint --strict
+
+  test:
+    runs-on: ${{ inputs.test-runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # Jon's apps consume lifted packages from jon-platform by LOCAL PATH
+      # (../../../jon-platform/packages/...). jon-platform isn't on the runner, so SPM
+      # resolution fails before any test runs. Clone it to the exact sibling location
+      # those relative deps point at: from <package-path>/, "../../.." lands beside the
+      # workspace; append jon-platform. The built-in GITHUB_TOKEN can't cross repos, so
+      # the caller supplies JON_PLATFORM_PAT via `secrets: inherit`.
+      - name: Check out jon-platform for local-path SPM deps
+        env:
+          JON_PLATFORM_PAT: ${{ secrets.JON_PLATFORM_PAT }}
+        run: |
+          set -euo pipefail
+          dest="$(cd "$GITHUB_WORKSPACE/${{ inputs.package-path }}" && cd ../../.. && pwd)/jon-platform"
+          echo "Cloning jon-platform to $dest"
+          git clone --depth 1 \
+            "https://x-access-token:${JON_PLATFORM_PAT}@github.com/jonphillips/jon-platform.git" \
+            "$dest"
+      - name: Select toolchain and check capability
+        id: toolchain
+        # Prefer a local Xcode beta if the image has one, then SKIP (green, not failed)
+        # when the runner's Swift is older than the manifest's tools-version — the app
+        # is verified locally until hosted runners ship the toolchain, at which point
+        # this runs for real with no change. We never fake a pass.
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode-beta.app/Contents/Developer ]; then
+            echo "DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer" >> "$GITHUB_ENV"
+          fi
+          required="$(sed -n 's#^// swift-tools-version: *\([0-9.]*\).*#\1#p' "${{ inputs.package-path }}/Package.swift" | head -1)"
+          have="$(swift -version 2>/dev/null | sed -n 's/.*Swift version \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
+          echo "Manifest requires Swift tools $required; runner has ${have:-unknown}."
+          if [ -n "$have" ] && [ "$(printf '%s\n%s\n' "$required" "$have" | sort -V | head -1)" = "$required" ]; then
+            echo "runnable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "runnable=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Runner Swift ${have:-unknown} < required $required. Skipping swift test until hosted runners ship a matching toolchain — verify locally with: swift test --package-path ${{ inputs.package-path }}"
+          fi
+      # Cold builds dominate this job: the macro-based deps (SQLiteData /
+      # StructuredQueries / Dependencies) build swift-syntax from source, the bulk of
+      # the pre-test compile. Cache .build keyed on the resolved graph so warm runs
+      # skip it; restore-keys lets a code-only change reuse the unchanged deps build.
+      # Gated on `runnable` so skip runs don't seed a junk cache.
+      - name: Cache SwiftPM build
+        if: steps.toolchain.outputs.runnable == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ inputs.package-path }}/.build
+          key: spm-${{ runner.os }}-${{ inputs.package-path }}-${{ hashFiles(format('{0}/Package.resolved', inputs.package-path)) }}
+          restore-keys: |
+            spm-${{ runner.os }}-${{ inputs.package-path }}-
+      - name: Run package tests
+        if: steps.toolchain.outputs.runnable == 'true'
+        run: swift test --package-path ${{ inputs.package-path }}
