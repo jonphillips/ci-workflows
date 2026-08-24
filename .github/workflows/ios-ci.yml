@@ -51,6 +51,13 @@ jobs:
 
   test:
     runs-on: ${{ inputs.test-runner }}
+    # Fail fast instead of hanging to GitHub's 6h ceiling. The cold macro build
+    # (swift-syntax + every macro plugin + all test targets) is heavy; a full-parallel
+    # build has been exhausting the runner's memory and thrashing for hours without
+    # finishing. This cap turns that into a clear ~75-min failure, and `-j 3` on the
+    # swift invocation below lowers peak memory so the build can actually complete and
+    # seed the cache; once the cache is warm, runs are far shorter and this is slack.
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       # Jon's apps consume lifted packages from jon-platform by LOCAL PATH
@@ -104,4 +111,7 @@ jobs:
             spm-${{ runner.os }}-${{ inputs.package-path }}-
       - name: Run package tests
         if: steps.toolchain.outputs.runnable == 'true'
-        run: swift test --package-path ${{ inputs.package-path }}
+        # `-j 3` caps build parallelism to keep peak memory under the runner's limit
+        # (macro expansion is memory-hungry; full parallelism thrashed and never
+        # finished). Slower per unit, but it completes — and seeds the .build cache.
+        run: swift test --package-path ${{ inputs.package-path }} -j 3
