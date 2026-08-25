@@ -34,6 +34,15 @@ on:
         required: false
         type: string
         default: "0.63.3"
+      min-swift:
+        description: >-
+          Optional minimum Swift version, ABOVE the manifest's tools-version. Use to skip
+          the test job (green) on a shipped toolchain with a known compiler bug for this
+          package until the runner offers a good one — e.g. galavant passes "6.4" because
+          Swift 6.3 hangs for hours compiling GalavantSchema while 6.4 builds it in seconds.
+        required: false
+        type: string
+        default: ""
     secrets:
       JON_PLATFORM_PAT:
         description: "Read-only PAT (Contents: read on jonphillips/jon-platform) to clone the private repo for local-path SPM deps."
@@ -51,12 +60,10 @@ jobs:
 
   test:
     runs-on: ${{ inputs.test-runner }}
-    # Fail fast instead of hanging to GitHub's 6h ceiling. The cold macro build
-    # (swift-syntax + every macro plugin + all test targets) is heavy; a full-parallel
-    # build has been exhausting the runner's memory and thrashing for hours without
-    # finishing. This cap turns that into a clear ~75-min failure, and `-j 3` on the
-    # swift invocation below lowers peak memory so the build can actually complete and
-    # seed the cache; once the cache is warm, runs are far shorter and this is slack.
+    # Defensive cap so a wedged build fails in ~75 min instead of burning to GitHub's
+    # 6h ceiling. (This bit galavant: Swift 6.3 deterministically HANGS compiling
+    # GalavantSchema — the `min-swift` gate below now skips it green on <6.4 runners,
+    # but the cap stays as a backstop for any future compiler/toolchain hang.)
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
@@ -78,23 +85,32 @@ jobs:
             "$dest"
       - name: Select toolchain and check capability
         id: toolchain
+        env:
+          MIN_SWIFT: ${{ inputs.min-swift }}
         # Prefer a local Xcode beta if the image has one, then SKIP (green, not failed)
-        # when the runner's Swift is older than the manifest's tools-version — the app
-        # is verified locally until hosted runners ship the toolchain, at which point
-        # this runs for real with no change. We never fake a pass.
+        # when the runner's Swift is below the required floor — the app is verified
+        # locally until hosted runners ship a good toolchain, at which point this runs
+        # for real with no change. We never fake a pass. The floor is the LARGER of the
+        # manifest's tools-version and the caller's optional `min-swift` (which lets an
+        # app dodge a known compiler hang on an older shipped toolchain).
         run: |
           set -euo pipefail
           if [ -d /Applications/Xcode-beta.app/Contents/Developer ]; then
-            echo "DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer" >> "$GITHUB_ENV"
+            export DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer
+            echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
           fi
           required="$(sed -n 's#^// swift-tools-version: *\([0-9.]*\).*#\1#p' "${{ inputs.package-path }}/Package.swift" | head -1)"
+          floor="$required"
+          if [ -n "${MIN_SWIFT:-}" ]; then
+            floor="$(printf '%s\n%s\n' "$required" "$MIN_SWIFT" | sort -V | tail -1)"
+          fi
           have="$(swift -version 2>/dev/null | sed -n 's/.*Swift version \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)"
-          echo "Manifest requires Swift tools $required; runner has ${have:-unknown}."
-          if [ -n "$have" ] && [ "$(printf '%s\n%s\n' "$required" "$have" | sort -V | head -1)" = "$required" ]; then
+          echo "Manifest tools $required; required floor $floor; runner has ${have:-unknown}."
+          if [ -n "$have" ] && [ "$(printf '%s\n%s\n' "$floor" "$have" | sort -V | head -1)" = "$floor" ]; then
             echo "runnable=true" >> "$GITHUB_OUTPUT"
           else
             echo "runnable=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Runner Swift ${have:-unknown} < required $required. Skipping swift test until hosted runners ship a matching toolchain — verify locally with: swift test --package-path ${{ inputs.package-path }}"
+            echo "::notice::Runner Swift ${have:-unknown} < required floor $floor. Skipping swift test until hosted runners ship a matching toolchain — verify locally with: swift test --package-path ${{ inputs.package-path }}"
           fi
       # Cold builds dominate this job: the macro-based deps (SQLiteData /
       # StructuredQueries / Dependencies) build swift-syntax from source, the bulk of
@@ -111,7 +127,4 @@ jobs:
             spm-${{ runner.os }}-${{ inputs.package-path }}-
       - name: Run package tests
         if: steps.toolchain.outputs.runnable == 'true'
-        # `-j 3` caps build parallelism to keep peak memory under the runner's limit
-        # (macro expansion is memory-hungry; full parallelism thrashed and never
-        # finished). Slower per unit, but it completes — and seeds the .build cache.
-        run: swift test --package-path ${{ inputs.package-path }} -j 3
+        run: swift test --package-path ${{ inputs.package-path }}
