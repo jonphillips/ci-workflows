@@ -20,6 +20,18 @@ on:
         description: "Path (repo-relative) to the SPM package holding the tests, e.g. GalavantLibrary or YesChefPackage."
         required: true
         type: string
+      platform-relative-root:
+        description: >-
+          Where jon-platform must sit for this repo's local-path SPM deps to resolve,
+          expressed relative to package-path. The default suits a repo whose package
+          sits at its root and which is checked out at <work>/<repo>/<repo>, so
+          "../../.." lands beside the workspace (galavant, yes-chef). An app nested
+          one level shallower or deeper passes its own value — cockpit, whose clone is
+          not doubled, uses "../..". Wrong depth means the clone lands where the
+          manifest isn't looking and resolution fails before any test runs.
+        required: false
+        type: string
+        default: "../../.."
       test-runner:
         description: >-
           Runner image for the test job. Apps whose manifest the hosted image can
@@ -69,16 +81,17 @@ jobs:
       - uses: actions/checkout@v4
       # Jon's apps consume lifted packages from jon-platform by LOCAL PATH
       # (../../../jon-platform/packages/...). jon-platform isn't on the runner, so SPM
-      # resolution fails before any test runs. Clone it to the exact sibling location
-      # those relative deps point at: from <package-path>/, "../../.." lands beside the
-      # workspace; append jon-platform. The built-in GITHUB_TOKEN can't cross repos, so
-      # the caller supplies JON_PLATFORM_PAT via `secrets: inherit`.
+      # resolution fails before any test runs. Clone it to the exact location those
+      # relative deps point at: from <package-path>/, walk up `platform-relative-root`
+      # (default "../../.." — beside the workspace) and append jon-platform. The built-in
+      # GITHUB_TOKEN can't cross repos, so the caller supplies JON_PLATFORM_PAT via
+      # `secrets: inherit`.
       - name: Check out jon-platform for local-path SPM deps
         env:
           JON_PLATFORM_PAT: ${{ secrets.JON_PLATFORM_PAT }}
         run: |
           set -euo pipefail
-          dest="$(cd "$GITHUB_WORKSPACE/${{ inputs.package-path }}" && cd ../../.. && pwd)/jon-platform"
+          dest="$(cd "$GITHUB_WORKSPACE/${{ inputs.package-path }}" && cd "${{ inputs.platform-relative-root }}" && pwd)/jon-platform"
           echo "Cloning jon-platform to $dest"
           git clone --depth 1 \
             "https://x-access-token:${JON_PLATFORM_PAT}@github.com/jonphillips/jon-platform.git" \
