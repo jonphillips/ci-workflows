@@ -9,9 +9,10 @@ name: iOS CI (reusable)
 # passed in at runtime via `secrets: inherit` and never exposed by this file.
 #
 # One-time setup per consuming app:
-#   The app repo needs a `JON_PLATFORM_PAT` secret (fine-grained, Contents: read on
-#   jonphillips/jon-platform) so the test job can clone jon-platform for the local-path
-#   SPM deps. (No cross-repo Actions access setting is needed for a public callee.)
+#   Run `~/code/jon-platform/scripts/platform-pat set <app-repo>` so the app repo has a
+#   `JON_PLATFORM_PAT` secret (fine-grained, Contents: read on jonphillips/jon-platform).
+#   Name the repo: discovery only finds it once this workflow is on its default branch.
+#   (No cross-repo Actions access setting is needed for a public callee.)
 
 on:
   workflow_call:
@@ -91,11 +92,26 @@ jobs:
           JON_PLATFORM_PAT: ${{ secrets.JON_PLATFORM_PAT }}
         run: |
           set -euo pipefail
+          fix="Run ~/code/jon-platform/scripts/platform-pat set ${GITHUB_REPOSITORY#*/}"
+          if [[ -z "${JON_PLATFORM_PAT:-}" ]]; then
+            echo "::error::This repo has no JON_PLATFORM_PAT secret. $fix"
+            exit 1
+          fi
           dest="$(cd "$GITHUB_WORKSPACE/${{ inputs.package-path }}" && cd "${{ inputs.platform-relative-root }}" && pwd)/jon-platform"
           echo "Cloning jon-platform to $dest"
-          git clone --depth 1 \
-            "https://x-access-token:${JON_PLATFORM_PAT}@github.com/jonphillips/jon-platform.git" \
-            "$dest"
+          if ! log="$(git clone --depth 1 \
+              "https://x-access-token:${JON_PLATFORM_PAT}@github.com/jonphillips/jon-platform.git" \
+              "$dest" 2>&1)"; then
+            echo "$log"
+            # Only an auth failure means the secret is stale; anything else (an outage, the
+            # network) would send someone to rotate a token that's fine.
+            if [[ "$log" == *"Invalid username or token"* || "$log" == *"Authentication failed"* ]]; then
+              echo "::error::GitHub rejected JON_PLATFORM_PAT: it was regenerated, expired or revoked. $fix"
+            else
+              echo "::error::Cloning jon-platform failed, but not on the token. Re-run the job."
+            fi
+            exit 1
+          fi
       - name: Select toolchain and check capability
         id: toolchain
         env:
